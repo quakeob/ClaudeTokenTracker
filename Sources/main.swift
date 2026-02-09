@@ -86,7 +86,7 @@ struct AppSettings: Codable {
     var firedMilestones: [Int64] = []
 
     // Data
-    var refreshInterval: Double = 5.0
+    var refreshInterval: Double = 10.0
 
     // Persisted state
     var windowX: Double?
@@ -195,6 +195,8 @@ class TokenStore: ObservableObject {
     private var fileWatcherSource: DispatchSourceFileSystemObject?
     private let scanQueue = DispatchQueue(label: "com.jakedavis.token-tracker.scan")
     private var fileStates: [String: JSONLFileState] = [:]
+    private var jsonlWatcherSources: [DispatchSourceFileSystemObject] = []
+    private var watchedPaths: Set<String> = []
     @Published var liveModelUsage: [String: ModelUsage]?
 
     init() {
@@ -298,10 +300,9 @@ class TokenStore: ObservableObject {
                 let lines = text.components(separatedBy: "\n")
 
                 for (i, line) in lines.enumerated() {
-                    if i == lines.count - 1 && !text.hasSuffix("\n") && !line.isEmpty {
-                        break
-                    }
-                    bytesConsumed += line.utf8.count + 1
+                    // Always skip the last element: it's either empty (after trailing \n) or an incomplete line
+                    if i == lines.count - 1 { break }
+                    bytesConsumed += line.utf8.count + 1  // +1 for \n separator
                     let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
                     if trimmed.isEmpty { continue }
 
@@ -349,9 +350,12 @@ class TokenStore: ObservableObject {
                 )
             }
 
+            let knownPaths = Array(self.fileStates.keys)
+
             DispatchQueue.main.async {
                 self.liveModelUsage = result
                 self.lastUpdated = Date()
+                self.watchJSONLFiles(paths: knownPaths)
                 NotificationManager.checkMilestones(
                     totalTokens: self.totalTokens, settings: &self.settings
                 )
@@ -361,6 +365,28 @@ class TokenStore: ObservableObject {
                     settings: &self.settings
                 )
             }
+        }
+    }
+
+    private func watchJSONLFiles(paths: [String]) {
+        for path in paths {
+            guard !watchedPaths.contains(path) else { continue }
+            let fd = open(path, O_EVTONLY)
+            guard fd >= 0 else { continue }
+            let source = DispatchSource.makeFileSystemObjectSource(
+                fileDescriptor: fd,
+                eventMask: [.write, .extend],
+                queue: .main
+            )
+            source.setEventHandler { [weak self] in
+                self?.scanJSONLFiles()
+            }
+            source.setCancelHandler {
+                close(fd)
+            }
+            source.resume()
+            jsonlWatcherSources.append(source)
+            watchedPaths.insert(path)
         }
     }
 
