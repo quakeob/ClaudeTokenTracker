@@ -79,6 +79,7 @@ xcrun swiftc \
     -sdk "$SDK_PATH" \
     -framework SwiftUI \
     -framework AppKit \
+    -framework IOKit \
     -o "$APP_BUNDLE/Contents/MacOS/$APP_NAME" \
     "$SCRIPT_DIR/Sources/main.swift"
 

@@ -1,6 +1,7 @@
 import Cocoa
 import SwiftUI
 import UserNotifications
+import IOKit
 
 // MARK: - Data Models
 
@@ -21,6 +22,16 @@ struct ModelUsage: Codable {
     var totalInput: Int64 {
         inputTokens + cacheReadInputTokens + cacheCreationInputTokens
     }
+}
+
+struct SyncPayload: Codable {
+    let schemaVersion: Int
+    let machineId: String
+    let machineName: String
+    let lastUpdated: String
+    let modelUsage: [String: ModelUsage]
+    let totalTokens: Int64
+    let appVersion: String
 }
 
 struct DailyActivity: Codable {
@@ -87,6 +98,10 @@ struct AppSettings: Codable {
 
     // Data
     var refreshInterval: Double = 10.0
+
+    // Sync
+    var syncEnabled: Bool = false
+    var syncFolderPath: String = ""
 
     // Persisted state
     var windowX: Double?
@@ -178,6 +193,186 @@ enum NotificationManager {
     }
 }
 
+// MARK: - Machine Identity
+
+enum MachineIdentity {
+    static var hardwareUUID: String {
+        let service = IOServiceGetMatchingService(
+            kIOMainPortDefault,
+            IOServiceMatching("IOPlatformExpertDevice")
+        )
+        defer { IOObjectRelease(service) }
+        guard service != 0,
+              let uuidRef = IORegistryEntryCreateCFProperty(
+                  service, "IOPlatformUUID" as CFString, kCFAllocatorDefault, 0
+              ) else {
+            return fallbackUUID()
+        }
+        return (uuidRef.takeRetainedValue() as? String) ?? fallbackUUID()
+    }
+
+    static var machineName: String {
+        Host.current().localizedName ?? ProcessInfo.processInfo.hostName
+    }
+
+    private static func fallbackUUID() -> String {
+        let key = "com.jakedavis.claude-token-tracker.machine-id"
+        if let existing = UserDefaults.standard.string(forKey: key) {
+            return existing
+        }
+        let newId = UUID().uuidString
+        UserDefaults.standard.set(newId, forKey: key)
+        return newId
+    }
+}
+
+// MARK: - Sync Folder Picker
+
+enum SyncFolderPicker {
+    static func chooseFolder(current: String?, completion: @escaping (String?) -> Void) {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = true
+        panel.message = "Choose a shared folder for cross-machine sync"
+        panel.prompt = "Select Sync Folder"
+        if let current = current, !current.isEmpty {
+            panel.directoryURL = URL(fileURLWithPath: current)
+        }
+        panel.level = NSWindow.Level(rawValue: NSWindow.Level.floating.rawValue + 1)
+        panel.begin { response in
+            if response == .OK, let url = panel.url {
+                completion(url.path)
+            } else {
+                completion(nil)
+            }
+        }
+    }
+}
+
+// MARK: - Sync Manager
+
+class SyncManager {
+    let machineId: String
+    let machineName: String
+
+    private var syncFolderURL: URL?
+    private var folderWatcherSource: DispatchSourceFileSystemObject?
+    private var debounceWorkItem: DispatchWorkItem?
+    private var lastWrittenPayload: Data?
+    private let writeQueue = DispatchQueue(label: "com.jakedavis.token-tracker.sync-write")
+
+    var remoteMachines: [SyncPayload] = []
+    var onRemoteDataChanged: (() -> Void)?
+
+    init() {
+        self.machineId = MachineIdentity.hardwareUUID
+        self.machineName = MachineIdentity.machineName
+    }
+
+    func configure(folderPath: String?) {
+        stopWatching()
+        guard let path = folderPath, !path.isEmpty else {
+            syncFolderURL = nil
+            remoteMachines = []
+            return
+        }
+        syncFolderURL = URL(fileURLWithPath: path)
+        startWatching()
+        readRemoteMachines()
+    }
+
+    func writeLocalData(modelUsage: [String: ModelUsage], totalTokens: Int64) {
+        guard let folderURL = syncFolderURL else { return }
+
+        debounceWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            let payload = SyncPayload(
+                schemaVersion: 1,
+                machineId: self.machineId,
+                machineName: self.machineName,
+                lastUpdated: ISO8601DateFormatter().string(from: Date()),
+                modelUsage: modelUsage,
+                totalTokens: totalTokens,
+                appVersion: "1.0"
+            )
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = .prettyPrinted
+            guard let data = try? encoder.encode(payload) else { return }
+            if data == self.lastWrittenPayload { return }
+            let fileURL = folderURL.appendingPathComponent("\(self.machineId).json")
+            try? data.write(to: fileURL, options: .atomic)
+            self.lastWrittenPayload = data
+        }
+        debounceWorkItem = workItem
+        writeQueue.asyncAfter(deadline: .now() + 30, execute: workItem)
+    }
+
+    func readRemoteMachines() {
+        guard let folderURL = syncFolderURL else { return }
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: folderURL,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else { return }
+
+        var remotes: [SyncPayload] = []
+        for file in files where file.pathExtension == "json" {
+            guard let data = try? Data(contentsOf: file),
+                  let payload = try? JSONDecoder().decode(SyncPayload.self, from: data) else {
+                continue
+            }
+            if payload.machineId == self.machineId { continue }
+            remotes.append(payload)
+        }
+        self.remoteMachines = remotes
+        DispatchQueue.main.async { self.onRemoteDataChanged?() }
+    }
+
+    private func startWatching() {
+        guard let folderURL = syncFolderURL else { return }
+        let fd = open(folderURL.path, O_EVTONLY)
+        guard fd >= 0 else { return }
+        let source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fd, eventMask: [.write], queue: .main
+        )
+        source.setEventHandler { [weak self] in self?.readRemoteMachines() }
+        source.setCancelHandler { close(fd) }
+        source.resume()
+        folderWatcherSource = source
+    }
+
+    private func stopWatching() {
+        folderWatcherSource?.cancel()
+        folderWatcherSource = nil
+    }
+
+    var combinedRemoteUsage: [String: ModelUsage] {
+        var combined: [String: [Int64]] = [:]
+        for remote in remoteMachines {
+            for (model, usage) in remote.modelUsage {
+                var c = combined[model] ?? [0, 0, 0, 0]
+                c[0] += usage.inputTokens
+                c[1] += usage.outputTokens
+                c[2] += usage.cacheReadInputTokens
+                c[3] += usage.cacheCreationInputTokens
+                combined[model] = c
+            }
+        }
+        var result: [String: ModelUsage] = [:]
+        for (model, c) in combined {
+            result[model] = ModelUsage(
+                inputTokens: c[0], outputTokens: c[1],
+                cacheReadInputTokens: c[2], cacheCreationInputTokens: c[3],
+                webSearchRequests: 0, costUSD: nil, contextWindow: nil, maxOutputTokens: nil
+            )
+        }
+        return result
+    }
+}
+
 // MARK: - Token Store
 
 class TokenStore: ObservableObject {
@@ -198,6 +393,8 @@ class TokenStore: ObservableObject {
     private var jsonlWatcherSources: [DispatchSourceFileSystemObject] = []
     private var watchedPaths: Set<String> = []
     @Published var liveModelUsage: [String: ModelUsage]?
+    private let syncManager = SyncManager()
+    @Published var remoteMachines: [SyncPayload] = []
 
     init() {
         let home = FileManager.default.homeDirectoryForCurrentUser
@@ -209,6 +406,20 @@ class TokenStore: ObservableObject {
         checkDayRollover()
         startAutoRefresh()
         startFileWatcher()
+        configureSyncManager()
+    }
+
+    func configureSyncManager() {
+        if settings.syncEnabled && !settings.syncFolderPath.isEmpty {
+            syncManager.configure(folderPath: settings.syncFolderPath)
+        } else {
+            syncManager.configure(folderPath: nil)
+        }
+        syncManager.onRemoteDataChanged = { [weak self] in
+            guard let self = self else { return }
+            self.remoteMachines = self.syncManager.remoteMachines
+            self.objectWillChange.send()
+        }
     }
 
     func reload() {
@@ -356,6 +567,12 @@ class TokenStore: ObservableObject {
                 self.liveModelUsage = result
                 self.lastUpdated = Date()
                 self.watchJSONLFiles(paths: knownPaths)
+                if self.settings.syncEnabled {
+                    self.syncManager.writeLocalData(
+                        modelUsage: result,
+                        totalTokens: result.values.reduce(0) { $0 + $1.totalTokens }
+                    )
+                }
                 NotificationManager.checkMilestones(
                     totalTokens: self.totalTokens, settings: &self.settings
                 )
@@ -462,8 +679,34 @@ class TokenStore: ObservableObject {
     // MARK: Computed stats
 
     private var effectiveModelUsage: [String: ModelUsage]? {
-        if let live = liveModelUsage, !live.isEmpty { return live }
-        return stats?.modelUsage
+        let local: [String: ModelUsage]?
+        if let live = liveModelUsage, !live.isEmpty {
+            local = live
+        } else {
+            local = stats?.modelUsage
+        }
+        guard settings.syncEnabled else { return local }
+        guard let localUsage = local else {
+            let remote = syncManager.combinedRemoteUsage
+            return remote.isEmpty ? nil : remote
+        }
+        let remoteUsage = syncManager.combinedRemoteUsage
+        guard !remoteUsage.isEmpty else { return localUsage }
+        var merged = localUsage
+        for (model, remote) in remoteUsage {
+            if let existing = merged[model] {
+                merged[model] = ModelUsage(
+                    inputTokens: existing.inputTokens + remote.inputTokens,
+                    outputTokens: existing.outputTokens + remote.outputTokens,
+                    cacheReadInputTokens: existing.cacheReadInputTokens + remote.cacheReadInputTokens,
+                    cacheCreationInputTokens: existing.cacheCreationInputTokens + remote.cacheCreationInputTokens,
+                    webSearchRequests: 0, costUSD: nil, contextWindow: nil, maxOutputTokens: nil
+                )
+            } else {
+                merged[model] = remote
+            }
+        }
+        return merged
     }
 
     var totalTokens: Int64 {
@@ -629,6 +872,11 @@ struct ContentView: View {
                 .font(.system(size: 10, weight: .semibold))
                 .tracking(1.2)
                 .foregroundStyle(.white.opacity(0.4))
+            if store.settings.syncEnabled && !store.remoteMachines.isEmpty {
+                Image(systemName: "arrow.triangle.2.circlepath.icloud.fill")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.green.opacity(0.4))
+            }
             Spacer()
             Button(action: { store.onOpenSettings?() }) {
                 Image(systemName: "gearshape")
@@ -961,6 +1209,10 @@ struct SettingsView: View {
     @State private var refreshInterval: Double = 5.0
     @State private var showResetConfirm: Bool = false
 
+    // Sync
+    @State private var syncEnabled: Bool = false
+    @State private var syncFolderPath: String = ""
+
     var body: some View {
         VStack(spacing: 0) {
             // Header
@@ -987,6 +1239,7 @@ struct SettingsView: View {
                     appearanceSection
                     budgetSection
                     dataSection
+                    syncSection
                     footerButtons
                     aboutSection
                 }
@@ -1207,6 +1460,103 @@ struct SettingsView: View {
         }
     }
 
+    // MARK: Sync
+
+    private var syncSection: some View {
+        VStack(spacing: 0) {
+            sectionHeader("SYNC")
+            toggleRow("Enable Sync", isOn: $syncEnabled)
+
+            if syncEnabled {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Sync Folder")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.6))
+                    HStack(spacing: 8) {
+                        Text(syncFolderPath.isEmpty ? "Not set" : abbreviatePath(syncFolderPath))
+                            .font(.system(size: 10, weight: .medium, design: .monospaced))
+                            .foregroundStyle(.white.opacity(syncFolderPath.isEmpty ? 0.25 : 0.5))
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        Button(action: chooseSyncFolder) {
+                            Text("Browse")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundStyle(.white.opacity(0.7))
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 5)
+                                .background(.white.opacity(0.08))
+                                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal, 20)
+                .padding(.vertical, 4)
+
+                if !store.remoteMachines.isEmpty {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Connected Machines")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.4))
+                        ForEach(Array(store.remoteMachines.enumerated()), id: \.offset) { _, machine in
+                            HStack(spacing: 6) {
+                                Circle()
+                                    .fill(machineStatusColor(machine))
+                                    .frame(width: 6, height: 6)
+                                Text(machine.machineName)
+                                    .font(.system(size: 10, weight: .medium))
+                                    .foregroundStyle(.white.opacity(0.55))
+                                Spacer()
+                                Text(formatCompact(machine.totalTokens))
+                                    .font(.system(size: 10, weight: .semibold, design: .rounded))
+                                    .foregroundStyle(.white.opacity(0.35))
+                            }
+                        }
+                    }
+                    .padding(.horizontal, 20)
+                    .padding(.vertical, 4)
+                } else if !syncFolderPath.isEmpty {
+                    Text("No other machines found yet")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.2))
+                        .padding(.horizontal, 20)
+                        .padding(.vertical, 4)
+                }
+
+                HStack {
+                    Text("This machine: \(MachineIdentity.machineName)")
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.18))
+                    Spacer()
+                }
+                .padding(.horizontal, 20)
+                .padding(.top, 2)
+            }
+        }
+    }
+
+    private func chooseSyncFolder() {
+        SyncFolderPicker.chooseFolder(current: syncFolderPath) { path in
+            if let path = path { syncFolderPath = path }
+        }
+    }
+
+    private func abbreviatePath(_ path: String) -> String {
+        path.replacingOccurrences(
+            of: FileManager.default.homeDirectoryForCurrentUser.path, with: "~"
+        )
+    }
+
+    private func machineStatusColor(_ machine: SyncPayload) -> Color {
+        let formatter = ISO8601DateFormatter()
+        guard let date = formatter.date(from: machine.lastUpdated) else { return .gray }
+        let age = Date().timeIntervalSince(date)
+        if age < 300 { return .green }
+        if age < 3600 { return .yellow }
+        return .gray
+    }
+
     // MARK: Footer
 
     private var footerButtons: some View {
@@ -1259,6 +1609,8 @@ struct SettingsView: View {
         warningThreshold = s.budgetWarningThreshold
         notificationsEnabled = s.notificationsEnabled
         refreshInterval = s.refreshInterval
+        syncEnabled = s.syncEnabled
+        syncFolderPath = s.syncFolderPath
     }
 
     private func save() {
@@ -1274,7 +1626,10 @@ struct SettingsView: View {
         store.settings.budgetWarningThreshold = warningThreshold
         store.settings.notificationsEnabled = notificationsEnabled
         store.settings.refreshInterval = refreshInterval
+        store.settings.syncEnabled = syncEnabled
+        store.settings.syncFolderPath = syncFolderPath
         store.settings.save()
+        store.configureSyncManager()
         store.setLaunchAtLogin(launchAtLogin)
         store.startAutoRefresh()
         store.objectWillChange.send()
