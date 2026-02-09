@@ -72,6 +72,18 @@ struct StatsCache: Codable {
 struct JSONLFileState {
     var offset: UInt64
     var modelTokens: [String: [Int64]]  // model -> [input, output, cacheRead, cacheCreate]
+    var dailyTokens: [String: Int64]    // "yyyy-MM-dd" -> total tokens
+}
+
+// MARK: - OpenClaw Session Data
+
+struct OpenClawSession: Codable {
+    let sessionId: String?
+    let inputTokens: Int64?
+    let outputTokens: Int64?
+    let totalTokens: Int64?
+    let contextTokens: Int64?
+    let updatedAt: String?
 }
 
 // MARK: - App Settings
@@ -395,6 +407,7 @@ class TokenStore: ObservableObject {
     @Published var liveModelUsage: [String: ModelUsage]?
     private let syncManager = SyncManager()
     @Published var remoteMachines: [SyncPayload] = []
+    @Published var dailyTokenHistory: [(date: String, tokens: Int64)] = []
 
     init() {
         let home = FileManager.default.homeDirectoryForCurrentUser
@@ -479,6 +492,7 @@ class TokenStore: ObservableObject {
             ) else { return }
 
             var allUsage: [String: [Int64]] = [:]
+            var allDaily: [String: Int64] = [:]
 
             for case let fileURL as URL in enumerator {
                 guard fileURL.pathExtension == "jsonl" else { continue }
@@ -492,12 +506,16 @@ class TokenStore: ObservableObject {
                         for i in 0..<4 { e[i] += counts[i] }
                         allUsage[model] = e
                     }
+                    for (day, tokens) in state.dailyTokens {
+                        allDaily[day, default: 0] += tokens
+                    }
                     continue
                 }
 
                 let existing = self.fileStates[path]
                 let startOffset = existing?.offset ?? 0
                 var fileCounts = existing?.modelTokens ?? [:]
+                var fileDays = existing?.dailyTokens ?? [:]
 
                 guard let fh = FileHandle(forReadingAtPath: path) else { continue }
                 defer { fh.closeFile() }
@@ -511,9 +529,8 @@ class TokenStore: ObservableObject {
                 let lines = text.components(separatedBy: "\n")
 
                 for (i, line) in lines.enumerated() {
-                    // Always skip the last element: it's either empty (after trailing \n) or an incomplete line
                     if i == lines.count - 1 { break }
-                    bytesConsumed += line.utf8.count + 1  // +1 for \n separator
+                    bytesConsumed += line.utf8.count + 1
                     let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
                     if trimmed.isEmpty { continue }
 
@@ -529,21 +546,53 @@ class TokenStore: ObservableObject {
                     let out = (usage["output_tokens"] as? NSNumber)?.int64Value ?? 0
                     let cr = (usage["cache_read_input_tokens"] as? NSNumber)?.int64Value ?? 0
                     let cc = (usage["cache_creation_input_tokens"] as? NSNumber)?.int64Value ?? 0
+                    let msgTotal = inp + out + cr + cc
 
                     var mc = fileCounts[model] ?? [0, 0, 0, 0]
                     mc[0] += inp; mc[1] += out; mc[2] += cr; mc[3] += cc
                     fileCounts[model] = mc
+
+                    // Extract date for daily tracking
+                    if let ts = obj["timestamp"] as? String, ts.count >= 10 {
+                        let day = String(ts.prefix(10))
+                        fileDays[day, default: 0] += msgTotal
+                    }
                 }
 
                 self.fileStates[path] = JSONLFileState(
                     offset: startOffset + UInt64(bytesConsumed),
-                    modelTokens: fileCounts
+                    modelTokens: fileCounts,
+                    dailyTokens: fileDays
                 )
 
                 for (model, counts) in fileCounts {
                     var e = allUsage[model] ?? [0, 0, 0, 0]
                     for i in 0..<4 { e[i] += counts[i] }
                     allUsage[model] = e
+                }
+                for (day, tokens) in fileDays {
+                    allDaily[day, default: 0] += tokens
+                }
+            }
+
+            // Scan OpenClaw sessions
+            let openclawDir = home.appendingPathComponent(".openclaw/agents")
+            if fm.fileExists(atPath: openclawDir.path),
+               let agentDirs = try? fm.contentsOfDirectory(at: openclawDir, includingPropertiesForKeys: nil) {
+                for agentDir in agentDirs {
+                    let sessionsFile = agentDir.appendingPathComponent("sessions/sessions.json")
+                    guard let data = try? Data(contentsOf: sessionsFile),
+                          let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
+                    for (_, value) in json {
+                        guard let session = value as? [String: Any] else { continue }
+                        let inp = (session["inputTokens"] as? NSNumber)?.int64Value ?? 0
+                        let out = (session["outputTokens"] as? NSNumber)?.int64Value ?? 0
+                        if inp + out > 0 {
+                            var mc = allUsage["openclaw"] ?? [0, 0, 0, 0]
+                            mc[0] += inp; mc[1] += out
+                            allUsage["openclaw"] = mc
+                        }
+                    }
                 }
             }
 
@@ -562,9 +611,13 @@ class TokenStore: ObservableObject {
             }
 
             let knownPaths = Array(self.fileStates.keys)
+            let sortedDaily = allDaily.sorted { $0.key < $1.key }
+                .suffix(14)
+                .map { (date: $0.key, tokens: $0.value) }
 
             DispatchQueue.main.async {
                 self.liveModelUsage = result
+                self.dailyTokenHistory = Array(sortedDaily)
                 self.lastUpdated = Date()
                 self.watchJSONLFiles(paths: knownPaths)
                 if self.settings.syncEnabled {
@@ -765,6 +818,7 @@ class TokenStore: ObservableObject {
         if raw.contains("sonnet-4-5") { return "Sonnet 4.5" }
         if raw.contains("sonnet-4") { return "Sonnet 4" }
         if raw.contains("haiku") { return "Haiku" }
+        if raw == "openclaw" { return "OpenClaw" }
         return raw
     }
 
@@ -773,6 +827,7 @@ class TokenStore: ObservableObject {
         if raw.contains("opus-4-5") { return .pink }
         if raw.contains("sonnet") { return .blue }
         if raw.contains("haiku") { return .green }
+        if raw == "openclaw" { return .red }
         return .gray
     }
 
@@ -845,6 +900,9 @@ struct ContentView: View {
             if !store.isMinimized {
                 todaySection
                 cardsSection
+                if !store.dailyTokenHistory.isEmpty {
+                    UsageGraph(data: store.dailyTokenHistory)
+                }
                 if store.settings.showModelBreakdown {
                     modelSection
                 }
@@ -1107,6 +1165,68 @@ struct BudgetBar: View {
                     .foregroundStyle(fraction >= 1.0 ? Color.red.opacity(0.7) : .white.opacity(0.25))
             }
         }
+    }
+}
+
+// MARK: - Usage Graph
+
+struct UsageGraph: View {
+    let data: [(date: String, tokens: Int64)]
+
+    private var maxTokens: Int64 {
+        data.map(\.tokens).max() ?? 1
+    }
+
+    var body: some View {
+        VStack(spacing: 6) {
+            HStack {
+                Text("Daily Usage")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.3))
+                Spacer()
+                Text("last \(data.count) days")
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.18))
+            }
+
+            HStack(alignment: .bottom, spacing: 2) {
+                ForEach(Array(data.enumerated()), id: \.offset) { _, entry in
+                    let fraction = CGFloat(entry.tokens) / CGFloat(maxTokens)
+                    VStack(spacing: 2) {
+                        RoundedRectangle(cornerRadius: 2, style: .continuous)
+                            .fill(barColor(fraction: fraction))
+                            .frame(height: max(2, 40 * fraction))
+                    }
+                    .frame(maxWidth: .infinity)
+                }
+            }
+            .frame(height: 40)
+
+            HStack {
+                Text(formatDayLabel(data.first?.date))
+                    .font(.system(size: 8, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.15))
+                Spacer()
+                Text(formatDayLabel(data.last?.date))
+                    .font(.system(size: 8, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.15))
+            }
+        }
+        .padding(.horizontal, 20)
+        .padding(.bottom, 14)
+    }
+
+    private func barColor(fraction: CGFloat) -> Color {
+        if fraction > 0.8 { return .orange.opacity(0.6) }
+        if fraction > 0.5 { return .cyan.opacity(0.5) }
+        return .cyan.opacity(0.35)
+    }
+
+    private func formatDayLabel(_ dateStr: String?) -> String {
+        guard let dateStr = dateStr, dateStr.count >= 10 else { return "" }
+        let parts = dateStr.split(separator: "-")
+        guard parts.count == 3 else { return dateStr }
+        return "\(parts[1])/\(parts[2])"
     }
 }
 
