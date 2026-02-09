@@ -1,0 +1,17 @@
+{
+  "version": 0,
+  "case-sensitive": false,
+  "roots": [
+    {
+      "name": "/Library/Developer/CommandLineTools/usr/include/swift",
+      "type": "directory",
+      "contents": [
+        {
+          "name": "module.modulemap",
+          "type": "file",
+          "external-contents": "/Users/jakedavis/Projects/ClaudeTokenTracker/empty.modulemap"
+        }
+      ]
+    }
+  ]
+}
