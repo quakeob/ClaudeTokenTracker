@@ -72,7 +72,7 @@ struct StatsCache: Codable {
 struct JSONLFileState {
     var offset: UInt64
     var modelTokens: [String: [Int64]]  // model -> [input, output, cacheRead, cacheCreate]
-    var dailyTokens: [String: Int64]    // "yyyy-MM-dd" -> total tokens
+    var hourlyTokens: [String: Int64]   // "yyyy-MM-dd-HH" -> total tokens
 }
 
 // MARK: - OpenClaw Session Data
@@ -114,6 +114,12 @@ struct AppSettings: Codable {
     // Sync
     var syncEnabled: Bool = false
     var syncFolderPath: String = ""
+
+    // Graph
+    var graphPeriod: String = "daily"  // "hourly", "daily", "weekly", "monthly"
+
+    // Discord
+    var discordPresenceEnabled: Bool = false
 
     // Persisted state
     var windowX: Double?
@@ -385,6 +391,134 @@ class SyncManager {
     }
 }
 
+// MARK: - Discord Rich Presence
+
+class DiscordRPC {
+    private static let clientId = "1471243711622156338"
+    private var fd: Int32 = -1
+    private var connected = false
+    private var enabled = false
+    private let queue = DispatchQueue(label: "com.jakedavis.token-tracker.discord")
+    private var reconnectWork: DispatchWorkItem?
+    private let launchTime = Int(Date().timeIntervalSince1970)
+
+    func setEnabled(_ on: Bool) {
+        enabled = on
+        if on { queue.async { self.connect() } }
+        else { queue.async { self.disconnect() } }
+    }
+
+    private func connect() {
+        guard fd < 0 else { return }
+        let tmp = (ProcessInfo.processInfo.environment["TMPDIR"] ?? NSTemporaryDirectory())
+            .replacingOccurrences(of: "/$", with: "", options: .regularExpression)
+        var candidates: [String] = []
+        for i in 0...9 { candidates.append("\(tmp)/discord-ipc-\(i)") }
+        if !tmp.hasPrefix("/tmp") {
+            for i in 0...9 { candidates.append("/tmp/discord-ipc-\(i)") }
+        }
+        for path in candidates {
+            if trySocket(path) {
+                sendFrame(op: 0, json: "{\"v\":1,\"client_id\":\"\(Self.clientId)\"}")
+                startReadLoop()
+                return
+            }
+        }
+        scheduleReconnect()
+    }
+
+    private func trySocket(_ path: String) -> Bool {
+        let s = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard s >= 0 else { return false }
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        let maxLen = MemoryLayout.size(ofValue: addr.sun_path)
+        guard path.utf8.count < maxLen else { close(s); return false }
+        _ = withUnsafeMutablePointer(to: &addr.sun_path.0) { ptr in
+            path.withCString { strcpy(ptr, $0) }
+        }
+        let ok = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.connect(s, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        } >= 0
+        guard ok else { close(s); return false }
+        fd = s
+        connected = true
+        return true
+    }
+
+    private func sendFrame(op: UInt32, json: String) {
+        guard fd >= 0, let payload = json.data(using: .utf8) else { return }
+        var buf = Data(capacity: 8 + payload.count)
+        var opLE = op.littleEndian
+        buf.append(Data(bytes: &opLE, count: 4))
+        var lenLE = UInt32(payload.count).littleEndian
+        buf.append(Data(bytes: &lenLE, count: 4))
+        buf.append(payload)
+        buf.withUnsafeBytes { _ = write(fd, $0.baseAddress!, buf.count) }
+    }
+
+    func updateActivity(details: String, state: String) {
+        guard enabled, connected else { return }
+        queue.async { [self] in
+            let pid = ProcessInfo.processInfo.processIdentifier
+            let nonce = UUID().uuidString
+            let json = """
+            {"cmd":"SET_ACTIVITY","args":{"pid":\(pid),"activity":{"details":"\(details)","state":"\(state)","timestamps":{"start":\(launchTime)},"assets":{"large_image":"icon","large_text":"Claude Token Tracker"}}},"nonce":"\(nonce)"}
+            """
+            sendFrame(op: 1, json: json)
+        }
+    }
+
+    private func startReadLoop() {
+        DispatchQueue.global(qos: .background).async { [weak self] in
+            var hdr = [UInt8](repeating: 0, count: 8)
+            while let self = self, self.connected, self.fd >= 0 {
+                let n = read(self.fd, &hdr, 8)
+                guard n == 8 else {
+                    self.queue.async { self.handleDisconnect() }
+                    return
+                }
+                let op = hdr.withUnsafeBytes { UInt32(littleEndian: $0.load(as: UInt32.self)) }
+                let len = hdr.withUnsafeBytes { UInt32(littleEndian: $0.load(fromByteOffset: 4, as: UInt32.self)) }
+                if len > 0 && len < 65536 {
+                    var body = [UInt8](repeating: 0, count: Int(len))
+                    let bn = read(self.fd, &body, Int(len))
+                    guard bn > 0 else {
+                        self.queue.async { self.handleDisconnect() }
+                        return
+                    }
+                }
+                if op == 3 { self.queue.async { self.sendFrame(op: 4, json: "{}") } }
+                if op == 2 { self.queue.async { self.handleDisconnect() }; return }
+            }
+        }
+    }
+
+    private func handleDisconnect() {
+        if fd >= 0 { close(fd); fd = -1 }
+        connected = false
+        if enabled { scheduleReconnect() }
+    }
+
+    private func disconnect() {
+        reconnectWork?.cancel()
+        connected = false
+        if fd >= 0 { close(fd); fd = -1 }
+    }
+
+    private func scheduleReconnect() {
+        reconnectWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self = self, self.enabled, !self.connected else { return }
+            self.connect()
+        }
+        reconnectWork = work
+        queue.asyncAfter(deadline: .now() + 15, execute: work)
+    }
+}
+
 // MARK: - Token Store
 
 class TokenStore: ObservableObject {
@@ -406,8 +540,10 @@ class TokenStore: ObservableObject {
     private var watchedPaths: Set<String> = []
     @Published var liveModelUsage: [String: ModelUsage]?
     private let syncManager = SyncManager()
+    private let discordRPC = DiscordRPC()
     @Published var remoteMachines: [SyncPayload] = []
     @Published var dailyTokenHistory: [(date: String, tokens: Int64)] = []
+    private var rawHourlyTokens: [String: Int64] = [:]
 
     init() {
         let home = FileManager.default.homeDirectoryForCurrentUser
@@ -420,6 +556,7 @@ class TokenStore: ObservableObject {
         startAutoRefresh()
         startFileWatcher()
         configureSyncManager()
+        configureDiscordRPC()
     }
 
     func configureSyncManager() {
@@ -433,6 +570,10 @@ class TokenStore: ObservableObject {
             self.remoteMachines = self.syncManager.remoteMachines
             self.objectWillChange.send()
         }
+    }
+
+    func configureDiscordRPC() {
+        discordRPC.setEnabled(settings.discordPresenceEnabled)
     }
 
     func reload() {
@@ -492,7 +633,12 @@ class TokenStore: ObservableObject {
             ) else { return }
 
             var allUsage: [String: [Int64]] = [:]
-            var allDaily: [String: Int64] = [:]
+            var allHourly: [String: Int64] = [:]
+            let isoFmt = ISO8601DateFormatter()
+            isoFmt.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            let localFmt = DateFormatter()
+            localFmt.dateFormat = "yyyy-MM-dd-HH"
+            localFmt.timeZone = .current
 
             for case let fileURL as URL in enumerator {
                 guard fileURL.pathExtension == "jsonl" else { continue }
@@ -506,8 +652,8 @@ class TokenStore: ObservableObject {
                         for i in 0..<4 { e[i] += counts[i] }
                         allUsage[model] = e
                     }
-                    for (day, tokens) in state.dailyTokens {
-                        allDaily[day, default: 0] += tokens
+                    for (hour, tokens) in state.hourlyTokens {
+                        allHourly[hour, default: 0] += tokens
                     }
                     continue
                 }
@@ -515,7 +661,7 @@ class TokenStore: ObservableObject {
                 let existing = self.fileStates[path]
                 let startOffset = existing?.offset ?? 0
                 var fileCounts = existing?.modelTokens ?? [:]
-                var fileDays = existing?.dailyTokens ?? [:]
+                var fileHours = existing?.hourlyTokens ?? [:]
 
                 guard let fh = FileHandle(forReadingAtPath: path) else { continue }
                 defer { fh.closeFile() }
@@ -552,17 +698,18 @@ class TokenStore: ObservableObject {
                     mc[0] += inp; mc[1] += out; mc[2] += cr; mc[3] += cc
                     fileCounts[model] = mc
 
-                    // Extract date for daily tracking
-                    if let ts = obj["timestamp"] as? String, ts.count >= 10 {
-                        let day = String(ts.prefix(10))
-                        fileDays[day, default: 0] += msgTotal
+                    // Extract date+hour for time tracking (convert UTC to local)
+                    if let ts = obj["timestamp"] as? String, ts.count >= 20,
+                       let date = isoFmt.date(from: ts) {
+                        let hourKey = localFmt.string(from: date)
+                        fileHours[hourKey, default: 0] += msgTotal
                     }
                 }
 
                 self.fileStates[path] = JSONLFileState(
                     offset: startOffset + UInt64(bytesConsumed),
                     modelTokens: fileCounts,
-                    dailyTokens: fileDays
+                    hourlyTokens: fileHours
                 )
 
                 for (model, counts) in fileCounts {
@@ -570,8 +717,8 @@ class TokenStore: ObservableObject {
                     for i in 0..<4 { e[i] += counts[i] }
                     allUsage[model] = e
                 }
-                for (day, tokens) in fileDays {
-                    allDaily[day, default: 0] += tokens
+                for (hour, tokens) in fileHours {
+                    allHourly[hour, default: 0] += tokens
                 }
             }
 
@@ -611,14 +758,18 @@ class TokenStore: ObservableObject {
             }
 
             let knownPaths = Array(self.fileStates.keys)
-            let sortedDaily = allDaily.sorted { $0.key < $1.key }
-                .suffix(14)
-                .map { (date: $0.key, tokens: $0.value) }
+            let aggregated = Self.aggregateTokenHistory(allHourly, period: self.settings.graphPeriod)
 
             DispatchQueue.main.async {
                 self.liveModelUsage = result
-                self.dailyTokenHistory = Array(sortedDaily)
+                self.rawHourlyTokens = allHourly
+                self.dailyTokenHistory = aggregated
                 self.lastUpdated = Date()
+                // Fix day start if it was set to 0 during early init
+                if self.settings.dayStartTokens == 0 && self.totalTokens > 0 {
+                    self.settings.dayStartTokens = self.totalTokens
+                    self.settings.save()
+                }
                 self.watchJSONLFiles(paths: knownPaths)
                 if self.settings.syncEnabled {
                     self.syncManager.writeLocalData(
@@ -634,6 +785,15 @@ class TokenStore: ObservableObject {
                     budget: self.settings.dailyBudget,
                     settings: &self.settings
                 )
+                if self.settings.discordPresenceEnabled {
+                    let todayStr = Self.todayString()
+                    let todayReal = self.rawHourlyTokens.filter { $0.key.hasPrefix(todayStr) }.values.reduce(0, +)
+                    let topModel = self.modelBreakdown.first?.name ?? "Claude"
+                    self.discordRPC.updateActivity(
+                        details: "Lifetime: \(formatCompact(self.totalTokens)) tokens",
+                        state: "Today: \(formatCompact(todayReal)) | \(topModel)"
+                    )
+                }
             }
         }
     }
@@ -695,6 +855,59 @@ class TokenStore: ObservableObject {
     var budgetFraction: Double {
         guard settings.dailyBudget > 0 else { return 0 }
         return Double(todayTokens) / Double(settings.dailyBudget)
+    }
+
+    // MARK: Graph Aggregation
+
+    func recomputeGraph() {
+        dailyTokenHistory = Self.aggregateTokenHistory(rawHourlyTokens, period: settings.graphPeriod)
+    }
+
+    static func aggregateTokenHistory(_ hourly: [String: Int64], period: String) -> [(date: String, tokens: Int64)] {
+        guard !hourly.isEmpty else { return [] }
+        var grouped: [String: Int64] = [:]
+
+        switch period {
+        case "hourly":
+            // Last 24 hours, key as-is "yyyy-MM-dd-HH"
+            grouped = hourly
+            let sorted = grouped.sorted { $0.key < $1.key }.suffix(24)
+            return sorted.map { (date: $0.key, tokens: $0.value) }
+
+        case "weekly":
+            // Group by ISO week: "yyyy-Www"
+            let cal = Calendar(identifier: .iso8601)
+            for (key, tokens) in hourly {
+                let dayStr = String(key.prefix(10))
+                let parts = dayStr.split(separator: "-")
+                guard parts.count == 3,
+                      let y = Int(parts[0]), let m = Int(parts[1]), let d = Int(parts[2]),
+                      let date = cal.date(from: DateComponents(year: y, month: m, day: d)) else { continue }
+                let week = cal.component(.weekOfYear, from: date)
+                let weekYear = cal.component(.yearForWeekOfYear, from: date)
+                let weekKey = String(format: "%04d-W%02d", weekYear, week)
+                grouped[weekKey, default: 0] += tokens
+            }
+            let sorted = grouped.sorted { $0.key < $1.key }.suffix(12)
+            return sorted.map { (date: $0.key, tokens: $0.value) }
+
+        case "monthly":
+            // Group by "yyyy-MM"
+            for (key, tokens) in hourly {
+                let monthKey = String(key.prefix(7))
+                grouped[monthKey, default: 0] += tokens
+            }
+            let sorted = grouped.sorted { $0.key < $1.key }.suffix(12)
+            return sorted.map { (date: $0.key, tokens: $0.value) }
+
+        default: // "daily"
+            for (key, tokens) in hourly {
+                let dayKey = String(key.prefix(10))
+                grouped[dayKey, default: 0] += tokens
+            }
+            let sorted = grouped.sorted { $0.key < $1.key }.suffix(14)
+            return sorted.map { (date: $0.key, tokens: $0.value) }
+        }
     }
 
     // MARK: Reset & Export
@@ -901,7 +1114,7 @@ struct ContentView: View {
                 todaySection
                 cardsSection
                 if !store.dailyTokenHistory.isEmpty {
-                    UsageGraph(data: store.dailyTokenHistory)
+                    UsageGraph(data: store.dailyTokenHistory, period: store.settings.graphPeriod)
                 }
                 if store.settings.showModelBreakdown {
                     modelSection
@@ -997,6 +1210,8 @@ struct ContentView: View {
                     Text(formatCompact(store.todayTokens))
                         .font(.system(size: 11, weight: .bold, design: .rounded))
                         .foregroundStyle(.white.opacity(0.6))
+                        .contentTransition(.numericText())
+                        .animation(.spring(duration: 0.4), value: store.todayTokens)
                 }
                 .padding(.horizontal, 20)
                 .padding(.bottom, 14)
@@ -1065,6 +1280,8 @@ struct ContentView: View {
                     Text(String(format: "~$%.2f", store.estimatedCost))
                         .font(.system(size: 11, weight: .bold, design: .rounded))
                         .foregroundStyle(.white.opacity(0.6))
+                        .contentTransition(.numericText())
+                        .animation(.spring(duration: 0.4), value: store.estimatedCost)
                 }
             }
 
@@ -1172,42 +1389,67 @@ struct BudgetBar: View {
 
 struct UsageGraph: View {
     let data: [(date: String, tokens: Int64)]
+    let period: String
+    @State private var hoveredIndex: Int? = nil
 
     private var maxTokens: Int64 {
         data.map(\.tokens).max() ?? 1
     }
 
+    private var periodLabel: String {
+        switch period {
+        case "hourly": return "Hourly"
+        case "weekly": return "Weekly"
+        case "monthly": return "Monthly"
+        default: return "Daily"
+        }
+    }
+
+    private var trailingLabel: String {
+        if let i = hoveredIndex, i < data.count {
+            return "\(formatLabel(data[i].date)): \(formatCompact(data[i].tokens))"
+        }
+        switch period {
+        case "hourly": return "last \(data.count)h"
+        case "weekly": return "last \(data.count)w"
+        case "monthly": return "last \(data.count)mo"
+        default: return "last \(data.count)d"
+        }
+    }
+
     var body: some View {
         VStack(spacing: 6) {
             HStack {
-                Text("Daily Usage")
+                Text("\(periodLabel) Usage")
                     .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(.white.opacity(0.3))
                 Spacer()
-                Text("last \(data.count) days")
+                Text(trailingLabel)
                     .font(.system(size: 9, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.18))
+                    .foregroundStyle(hoveredIndex != nil ? .white.opacity(0.5) : .white.opacity(0.18))
+                    .animation(.easeOut(duration: 0.15), value: hoveredIndex)
             }
 
             HStack(alignment: .bottom, spacing: 2) {
-                ForEach(Array(data.enumerated()), id: \.offset) { _, entry in
+                ForEach(Array(data.enumerated()), id: \.offset) { offset, entry in
                     let fraction = CGFloat(entry.tokens) / CGFloat(maxTokens)
-                    VStack(spacing: 2) {
-                        RoundedRectangle(cornerRadius: 2, style: .continuous)
-                            .fill(barColor(fraction: fraction))
-                            .frame(height: max(2, 40 * fraction))
-                    }
-                    .frame(maxWidth: .infinity)
+                    RoundedRectangle(cornerRadius: 2, style: .continuous)
+                        .fill(hoveredIndex == offset ? barColor(fraction: fraction).opacity(1.0) : barColor(fraction: fraction))
+                        .frame(height: max(2, 40 * fraction))
+                        .frame(maxWidth: .infinity)
+                        .onHover { hovering in
+                            hoveredIndex = hovering ? offset : nil
+                        }
                 }
             }
             .frame(height: 40)
 
             HStack {
-                Text(formatDayLabel(data.first?.date))
+                Text(formatLabel(data.first?.date))
                     .font(.system(size: 8, weight: .medium))
                     .foregroundStyle(.white.opacity(0.15))
                 Spacer()
-                Text(formatDayLabel(data.last?.date))
+                Text(formatLabel(data.last?.date))
                     .font(.system(size: 8, weight: .medium))
                     .foregroundStyle(.white.opacity(0.15))
             }
@@ -1222,11 +1464,34 @@ struct UsageGraph: View {
         return .cyan.opacity(0.35)
     }
 
-    private func formatDayLabel(_ dateStr: String?) -> String {
-        guard let dateStr = dateStr, dateStr.count >= 10 else { return "" }
-        let parts = dateStr.split(separator: "-")
-        guard parts.count == 3 else { return dateStr }
-        return "\(parts[1])/\(parts[2])"
+    private func formatLabel(_ key: String?) -> String {
+        guard let key = key else { return "" }
+        switch period {
+        case "hourly":
+            // "yyyy-MM-dd-HH" -> "3pm"
+            guard key.count >= 13 else { return key }
+            let hh = String(key.suffix(2))
+            guard let h = Int(hh) else { return hh }
+            if h == 0 { return "12a" }
+            if h < 12 { return "\(h)a" }
+            if h == 12 { return "12p" }
+            return "\(h - 12)p"
+        case "weekly":
+            // "yyyy-Www" -> "W6"
+            if key.contains("W") { return String(key.suffix(from: key.index(key.startIndex, offsetBy: 5))) }
+            return key
+        case "monthly":
+            // "yyyy-MM" -> "Jan"
+            let months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+            guard key.count >= 7, let m = Int(key.suffix(2)), m >= 1, m <= 12 else { return key }
+            return months[m - 1]
+        default:
+            // "yyyy-MM-dd" -> "02/11"
+            guard key.count >= 10 else { return key }
+            let parts = key.split(separator: "-")
+            guard parts.count >= 3 else { return key }
+            return "\(parts[1])/\(parts[2])"
+        }
     }
 }
 
@@ -1251,7 +1516,9 @@ struct StatCard: View {
             Text(value)
                 .font(.system(size: 22, weight: .bold, design: .rounded))
                 .foregroundStyle(.white.opacity(0.85))
+                .contentTransition(.numericText())
         }
+        .animation(.spring(duration: 0.4), value: value)
         .frame(maxWidth: .infinity)
         .padding(.vertical, 12)
         .background(.white.opacity(0.05))
@@ -1328,10 +1595,17 @@ struct SettingsView: View {
     // Data
     @State private var refreshInterval: Double = 5.0
     @State private var showResetConfirm: Bool = false
+    @State private var settingsLoaded: Bool = false
 
     // Sync
     @State private var syncEnabled: Bool = false
     @State private var syncFolderPath: String = ""
+
+    // Graph
+    @State private var graphPeriod: String = "daily"
+
+    // Discord
+    @State private var discordPresenceEnabled: Bool = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1360,6 +1634,7 @@ struct SettingsView: View {
                     budgetSection
                     dataSection
                     syncSection
+                    discordSection
                     footerButtons
                     aboutSection
                 }
@@ -1381,7 +1656,15 @@ struct SettingsView: View {
                 )
         )
         .shadow(color: .black.opacity(0.25), radius: 20, y: 8)
-        .onAppear { loadValues() }
+        .onAppear {
+            loadValues()
+            DispatchQueue.main.async { settingsLoaded = true }
+        }
+        .onChange(of: settingsKey) { autoSave() }
+    }
+
+    private var settingsKey: String {
+        "\(launchAtLogin)\(alwaysOnTop)\(showOnAllSpaces)\(startMinimized)\(widgetOpacity)\(showCostEstimate)\(showModelBreakdown)\(showSessionStats)\(graphPeriod)\(budgetText)\(warningThreshold)\(notificationsEnabled)\(refreshInterval)\(syncEnabled)\(syncFolderPath)\(discordPresenceEnabled)"
     }
 
     // MARK: Section Header
@@ -1454,6 +1737,28 @@ struct SettingsView: View {
             toggleRow("Show Cost Estimate", isOn: $showCostEstimate)
             toggleRow("Show Model Breakdown", isOn: $showModelBreakdown)
             toggleRow("Show Session Stats", isOn: $showSessionStats)
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Graph Period")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.6))
+                HStack(spacing: 4) {
+                    ForEach(["hourly", "daily", "weekly", "monthly"], id: \.self) { period in
+                        Button(action: { graphPeriod = period }) {
+                            Text(period.prefix(1).uppercased())
+                                .font(.system(size: 10, weight: .bold))
+                                .foregroundStyle(graphPeriod == period ? .white.opacity(0.9) : .white.opacity(0.35))
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 5)
+                                .background(graphPeriod == period ? .white.opacity(0.12) : .white.opacity(0.04))
+                                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 4)
         }
     }
 
@@ -1656,6 +1961,22 @@ struct SettingsView: View {
         }
     }
 
+    // MARK: Discord
+
+    private var discordSection: some View {
+        VStack(spacing: 0) {
+            sectionHeader("DISCORD")
+            toggleRow("Rich Presence", isOn: $discordPresenceEnabled)
+            if discordPresenceEnabled {
+                Text("Shows token stats in your Discord status")
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.2))
+                    .padding(.horizontal, 20)
+                    .padding(.top, 2)
+            }
+        }
+    }
+
     private func chooseSyncFolder() {
         SyncFolderPicker.chooseFolder(current: syncFolderPath) { path in
             if let path = path { syncFolderPath = path }
@@ -1680,8 +2001,8 @@ struct SettingsView: View {
     // MARK: Footer
 
     private var footerButtons: some View {
-        Button(action: save) {
-            Text("Save")
+        Button(action: onClose) {
+            Text("Done")
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(.white.opacity(0.85))
                 .frame(maxWidth: .infinity)
@@ -1731,9 +2052,12 @@ struct SettingsView: View {
         refreshInterval = s.refreshInterval
         syncEnabled = s.syncEnabled
         syncFolderPath = s.syncFolderPath
+        graphPeriod = s.graphPeriod
+        discordPresenceEnabled = s.discordPresenceEnabled
     }
 
-    private func save() {
+    private func autoSave() {
+        guard settingsLoaded else { return }
         let cleaned = budgetText.replacingOccurrences(of: ",", with: "")
         store.settings.dailyBudget = max(0, Int64(cleaned) ?? 0)
         store.settings.alwaysOnTop = alwaysOnTop
@@ -1748,14 +2072,17 @@ struct SettingsView: View {
         store.settings.refreshInterval = refreshInterval
         store.settings.syncEnabled = syncEnabled
         store.settings.syncFolderPath = syncFolderPath
+        store.settings.graphPeriod = graphPeriod
+        store.settings.discordPresenceEnabled = discordPresenceEnabled
         store.settings.save()
         store.configureSyncManager()
+        store.configureDiscordRPC()
+        store.recomputeGraph()
         store.setLaunchAtLogin(launchAtLogin)
         store.startAutoRefresh()
         store.objectWillChange.send()
         store.onSettingsChanged?()
         store.onSizeChange?()
-        onClose()
     }
 }
 
