@@ -519,6 +519,103 @@ class DiscordRPC {
     }
 }
 
+// MARK: - Auto Updater
+
+class Updater {
+    enum Status { case idle, checking, updateAvailable, updating, done, failed(String) }
+
+    private(set) var status: Status = .idle
+    var onStatusChanged: (() -> Void)?
+
+    private let repo = "quakeob/ClaudeTokenTracker"
+    private let queue = DispatchQueue(label: "com.jakedavis.token-tracker.updater")
+
+    var sourcePath: String? {
+        guard let url = Bundle.main.url(forResource: "source-path", withExtension: "txt"),
+              let path = try? String(contentsOf: url, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
+              FileManager.default.fileExists(atPath: path + "/.git") else { return nil }
+        return path
+    }
+
+    func checkForUpdate() {
+        guard let src = sourcePath else {
+            setStatus(.failed("Source not found"))
+            return
+        }
+        setStatus(.checking)
+        queue.async {
+            // Fetch remote without merging
+            let fetchResult = self.shell("cd '\(src)' && git fetch origin main 2>&1")
+            guard fetchResult != nil else {
+                self.setStatus(.failed("Fetch failed"))
+                return
+            }
+            // Compare local vs remote
+            let local = self.shell("cd '\(src)' && git rev-parse HEAD")?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let remote = self.shell("cd '\(src)' && git rev-parse origin/main")?.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let local = local, let remote = remote else {
+                self.setStatus(.failed("Git error"))
+                return
+            }
+            if local == remote {
+                self.setStatus(.idle)
+            } else {
+                self.setStatus(.updateAvailable)
+            }
+        }
+    }
+
+    func performUpdate() {
+        guard let src = sourcePath else { return }
+        setStatus(.updating)
+        queue.async {
+            // Pull, build, install
+            let result = self.shell("cd '\(src)' && git pull origin main 2>&1 && bash build.sh 2>&1")
+            guard result != nil else {
+                self.setStatus(.failed("Build failed"))
+                return
+            }
+            let appSrc = "\(src)/build/ClaudeTokenTracker.app"
+            let appDst = "/Applications/ClaudeTokenTracker.app"
+            _ = self.shell("rm -rf '\(appDst)' && cp -r '\(appSrc)' '\(appDst)'")
+            self.setStatus(.done)
+            // Relaunch from /Applications
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                let url = URL(fileURLWithPath: appDst)
+                NSWorkspace.shared.open(url)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                    NSApp.terminate(nil)
+                }
+            }
+        }
+    }
+
+    private func shell(_ cmd: String) -> String? {
+        let proc = Process()
+        proc.launchPath = "/bin/bash"
+        proc.arguments = ["-c", cmd]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = pipe
+        do {
+            try proc.run()
+            proc.waitUntilExit()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            guard proc.terminationStatus == 0 else { return nil }
+            return String(data: data, encoding: .utf8)
+        } catch {
+            return nil
+        }
+    }
+
+    private func setStatus(_ s: Status) {
+        DispatchQueue.main.async {
+            self.status = s
+            self.onStatusChanged?()
+        }
+    }
+}
+
 // MARK: - Token Store
 
 class TokenStore: ObservableObject {
@@ -541,6 +638,7 @@ class TokenStore: ObservableObject {
     @Published var liveModelUsage: [String: ModelUsage]?
     private let syncManager = SyncManager()
     private let discordRPC = DiscordRPC()
+    let updater = Updater()
     @Published var remoteMachines: [SyncPayload] = []
     @Published var dailyTokenHistory: [(date: String, tokens: Int64)] = []
     private var rawHourlyTokens: [String: Int64] = [:]
@@ -557,6 +655,7 @@ class TokenStore: ObservableObject {
         startFileWatcher()
         configureSyncManager()
         configureDiscordRPC()
+        updater.onStatusChanged = { [weak self] in self?.objectWillChange.send() }
     }
 
     func configureSyncManager() {
@@ -1107,21 +1206,58 @@ struct ContentView: View {
     @ObservedObject var store: TokenStore
 
     var body: some View {
+        Group {
+            if store.isMinimized {
+                compactPill
+            } else {
+                fullWidget
+            }
+        }
+        .opacity(store.settings.widgetOpacity)
+    }
+
+    private var compactPill: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "sparkle")
+                .font(.system(size: 9, weight: .bold))
+                .foregroundStyle(.white.opacity(0.5))
+            Text(formatCompact(store.totalTokens))
+                .font(.system(size: 13, weight: .bold, design: .rounded))
+                .foregroundStyle(.white.opacity(0.85))
+                .contentTransition(.numericText())
+                .animation(.spring(duration: 0.4), value: store.totalTokens)
+            Text("tokens")
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(.white.opacity(0.3))
+            Button(action: { store.toggleMinimized() }) {
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 8, weight: .bold))
+                    .foregroundStyle(.white.opacity(0.25))
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(.ultraThinMaterial)
+        .clipShape(Capsule(style: .continuous))
+        .overlay(Capsule(style: .continuous).stroke(.white.opacity(0.12), lineWidth: 0.5))
+        .shadow(color: .black.opacity(0.2), radius: 12, y: 4)
+    }
+
+    private var fullWidget: some View {
         VStack(spacing: 0) {
             headerSection
             heroSection
-            if !store.isMinimized {
-                todaySection
-                cardsSection
-                if !store.dailyTokenHistory.isEmpty {
-                    UsageGraph(data: store.dailyTokenHistory, period: store.settings.graphPeriod)
-                }
-                if store.settings.showModelBreakdown {
-                    modelSection
-                }
-                divider
-                footerSection
+            todaySection
+            cardsSection
+            if !store.dailyTokenHistory.isEmpty {
+                UsageGraph(data: store.dailyTokenHistory, period: store.settings.graphPeriod)
             }
+            if store.settings.showModelBreakdown {
+                modelSection
+            }
+            divider
+            footerSection
         }
         .frame(width: 280)
         .background(.ultraThinMaterial)
@@ -1129,7 +1265,6 @@ struct ContentView: View {
         .overlay(glassHighlight)
         .overlay(glassBorder)
         .shadow(color: .black.opacity(0.25), radius: 30, y: 12)
-        .opacity(store.settings.widgetOpacity)
     }
 
     // MARK: Header
@@ -2020,11 +2155,100 @@ struct SettingsView: View {
     }
 
     private var aboutSection: some View {
-        Text("Claude Token Tracker v1.0")
-            .font(.system(size: 9, weight: .medium))
-            .foregroundStyle(.white.opacity(0.15))
-            .padding(.top, 10)
+        VStack(spacing: 8) {
+            if store.updater.sourcePath != nil {
+                Button(action: {
+                    switch store.updater.status {
+                    case .updateAvailable:
+                        store.updater.performUpdate()
+                    default:
+                        store.updater.checkForUpdate()
+                    }
+                }) {
+                    HStack(spacing: 6) {
+                        updateIcon
+                        Text(updateLabel)
+                            .font(.system(size: 10, weight: .semibold))
+                    }
+                    .foregroundStyle(updateColor)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 7)
+                    .background(updateColor.opacity(0.08))
+                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                }
+                .buttonStyle(.plain)
+                .padding(.horizontal, 20)
+                .disabled(isUpdateBusy)
+            }
+            VStack(spacing: 4) {
+                Text("Claude Token Tracker v1.9")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.25))
+                Text("by Jake Davis")
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.15))
+            }
+
+            Button(action: {
+                if let url = URL(string: "https://github.com/quakeob/ClaudeTokenTracker/issues") {
+                    NSWorkspace.shared.open(url)
+                }
+            }) {
+                HStack(spacing: 4) {
+                    Image(systemName: "questionmark.circle")
+                        .font(.system(size: 9))
+                    Text("Support & Feedback")
+                        .font(.system(size: 10, weight: .medium))
+                }
+                .foregroundStyle(.white.opacity(0.35))
+            }
+            .buttonStyle(.plain)
             .padding(.bottom, 16)
+        }
+        .padding(.top, 10)
+    }
+
+    private var isUpdateBusy: Bool {
+        switch store.updater.status {
+        case .checking, .updating, .done: return true
+        default: return false
+        }
+    }
+
+    private var updateLabel: String {
+        switch store.updater.status {
+        case .idle: return "Check for Updates"
+        case .checking: return "Checking..."
+        case .updateAvailable: return "Update Available — Install"
+        case .updating: return "Updating..."
+        case .done: return "Relaunching..."
+        case .failed(let msg): return "Failed: \(msg)"
+        }
+    }
+
+    private var updateColor: Color {
+        switch store.updater.status {
+        case .updateAvailable: return .green
+        case .failed: return .red
+        case .updating, .done: return .orange
+        default: return .white.opacity(0.7)
+        }
+    }
+
+    @ViewBuilder
+    private var updateIcon: some View {
+        switch store.updater.status {
+        case .checking, .updating:
+            ProgressView().controlSize(.small)
+        case .updateAvailable:
+            Image(systemName: "arrow.down.circle.fill").font(.system(size: 10))
+        case .done:
+            Image(systemName: "checkmark.circle.fill").font(.system(size: 10))
+        case .failed:
+            Image(systemName: "exclamationmark.triangle.fill").font(.system(size: 10))
+        default:
+            Image(systemName: "arrow.clockwise").font(.system(size: 10))
+        }
     }
 
     // MARK: Helpers

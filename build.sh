@@ -71,6 +71,7 @@ mkdir -p "$APP_BUNDLE/Contents/MacOS"
 mkdir -p "$APP_BUNDLE/Contents/Resources"
 
 cp "$SCRIPT_DIR/Info.plist" "$APP_BUNDLE/Contents/"
+echo -n "$SCRIPT_DIR" > "$APP_BUNDLE/Contents/Resources/source-path.txt"
 
 xcrun swiftc \
     $VFS_FLAGS \
