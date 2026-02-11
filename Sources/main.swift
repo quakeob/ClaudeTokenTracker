@@ -2184,9 +2184,16 @@ struct SettingsView: View {
                 Text("Claude Token Tracker v1.9")
                     .font(.system(size: 10, weight: .semibold))
                     .foregroundStyle(.white.opacity(0.25))
-                Text("by Jake Davis")
-                    .font(.system(size: 9, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.15))
+                Button(action: {
+                    if let url = URL(string: "https://jakedev.org") {
+                        NSWorkspace.shared.open(url)
+                    }
+                }) {
+                    Text("by jakedev.org")
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.2))
+                }
+                .buttonStyle(.plain)
             }
 
             Button(action: {
