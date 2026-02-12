@@ -25,7 +25,7 @@ Built with SwiftUI. No Xcode required — compiles with just Command Line Tools.
 ## Install
 
 ```bash
-git clone https://github.com/JakeDavisGH/ClaudeTokenTracker.git
+git clone https://github.com/quakeob/ClaudeTokenTracker.git
 cd ClaudeTokenTracker
 bash install.sh
 ```
