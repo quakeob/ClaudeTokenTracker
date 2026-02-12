@@ -282,6 +282,7 @@ class SyncManager {
     private var folderWatcherSource: DispatchSourceFileSystemObject?
     private var debounceWorkItem: DispatchWorkItem?
     private var lastWrittenPayload: Data?
+    private var lastWriteTime: Date = .distantPast
     private let writeQueue = DispatchQueue(label: "com.jakedavis.token-tracker.sync-write")
 
     var remoteMachines: [SyncPayload] = []
@@ -306,9 +307,9 @@ class SyncManager {
 
     func writeLocalData(modelUsage: [String: ModelUsage], totalTokens: Int64) {
         guard let folderURL = syncFolderURL else { return }
-
-        debounceWorkItem?.cancel()
-        let workItem = DispatchWorkItem { [weak self] in
+        let now = Date()
+        guard now.timeIntervalSince(lastWriteTime) >= 30 else { return }
+        writeQueue.async { [weak self] in
             guard let self = self else { return }
             let payload = SyncPayload(
                 schemaVersion: 1,
@@ -326,9 +327,8 @@ class SyncManager {
             let fileURL = folderURL.appendingPathComponent("\(self.machineId).json")
             try? data.write(to: fileURL, options: .atomic)
             self.lastWrittenPayload = data
+            self.lastWriteTime = Date()
         }
-        debounceWorkItem = workItem
-        writeQueue.asyncAfter(deadline: .now() + 30, execute: workItem)
     }
 
     func readRemoteMachines() {
