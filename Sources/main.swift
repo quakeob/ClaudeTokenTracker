@@ -2,6 +2,9 @@ import Cocoa
 import SwiftUI
 import UserNotifications
 import IOKit
+import WidgetKit
+
+private let realHome = FileManager.default.homeDirectoryForCurrentUser
 
 // MARK: - Data Models
 
@@ -128,7 +131,7 @@ struct AppSettings: Codable {
     var dayStartDate: String = ""
 
     static let fileURL: URL = {
-        let home = FileManager.default.homeDirectoryForCurrentUser
+        let home = realHome
         return home.appendingPathComponent(".claude-token-tracker.json")
     }()
 
@@ -644,7 +647,7 @@ class TokenStore: ObservableObject {
     private var rawHourlyTokens: [String: Int64] = [:]
 
     init() {
-        let home = FileManager.default.homeDirectoryForCurrentUser
+        let home = realHome
         statsURL = home.appendingPathComponent(".claude/stats-cache.json")
         settings = AppSettings.load()
         if settings.startMinimized { isMinimized = true }
@@ -673,6 +676,29 @@ class TokenStore: ObservableObject {
 
     func configureDiscordRPC() {
         discordRPC.setEnabled(settings.discordPresenceEnabled)
+    }
+
+    private var lastWidgetPush: Date = .distantPast
+
+    func pushWidgetData() {
+        let home = realHome
+        let widgetFile = home.appendingPathComponent(".claude-token-tracker-widget.json")
+        let data: [String: Any] = [
+            "totalTokens": totalTokens,
+            "todayTokens": todayTokens,
+            "estimatedCost": estimatedCost,
+            "topModel": modelBreakdown.first?.name ?? "Claude",
+            "lastUpdated": Date().timeIntervalSince1970
+        ]
+        if let json = try? JSONSerialization.data(withJSONObject: data) {
+            try? json.write(to: widgetFile)
+        }
+        // Debounce timeline reloads to avoid burning the widget budget
+        let now = Date()
+        if now.timeIntervalSince(lastWidgetPush) >= 300 {
+            lastWidgetPush = now
+            WidgetCenter.shared.reloadTimelines(ofKind: "TokenTrackerWidget")
+        }
     }
 
     func reload() {
@@ -721,7 +747,7 @@ class TokenStore: ObservableObject {
         scanQueue.async { [weak self] in
             guard let self = self else { return }
             let fm = FileManager.default
-            let home = fm.homeDirectoryForCurrentUser
+            let home = realHome
             let projectsDir = home.appendingPathComponent(".claude/projects")
             guard fm.fileExists(atPath: projectsDir.path) else { return }
 
@@ -893,6 +919,7 @@ class TokenStore: ObservableObject {
                         state: "Today: \(formatCompact(todayReal)) | \(topModel)"
                     )
                 }
+                self.pushWidgetData()
             }
         }
     }
@@ -1035,7 +1062,7 @@ class TokenStore: ObservableObject {
             csv += "\(day.date),\(day.messageCount),\(day.sessionCount),\(day.toolCallCount)\n"
         }
 
-        let home = FileManager.default.homeDirectoryForCurrentUser
+        let home = realHome
         let desktop = home.appendingPathComponent("Desktop/claude-token-usage.csv")
         try? csv.write(to: desktop, atomically: true, encoding: .utf8)
         NSWorkspace.shared.selectFile(desktop.path, inFileViewerRootedAtPath: "")
@@ -1156,13 +1183,13 @@ class TokenStore: ObservableObject {
     // MARK: Launch at login
 
     var isLaunchAtLoginEnabled: Bool {
-        let home = FileManager.default.homeDirectoryForCurrentUser
+        let home = realHome
         let plist = home.appendingPathComponent("Library/LaunchAgents/com.jakedavis.claude-token-tracker.plist")
         return FileManager.default.fileExists(atPath: plist.path)
     }
 
     func setLaunchAtLogin(_ enabled: Bool) {
-        let home = FileManager.default.homeDirectoryForCurrentUser
+        let home = realHome
         let agentDir = home.appendingPathComponent("Library/LaunchAgents")
         let plistURL = agentDir.appendingPathComponent("com.jakedavis.claude-token-tracker.plist")
 
@@ -2120,7 +2147,7 @@ struct SettingsView: View {
 
     private func abbreviatePath(_ path: String) -> String {
         path.replacingOccurrences(
-            of: FileManager.default.homeDirectoryForCurrentUser.path, with: "~"
+            of: realHome.path, with: "~"
         )
     }
 

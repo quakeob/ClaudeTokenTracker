@@ -60,7 +60,7 @@ else
     exit 1
 fi
 
-# --- Build ---
+# --- Build Main App ---
 
 echo "Building $APP_NAME..."
 echo "  Architecture: $ARCH"
@@ -81,8 +81,43 @@ xcrun swiftc \
     -framework SwiftUI \
     -framework AppKit \
     -framework IOKit \
+    -framework WidgetKit \
     -o "$APP_BUNDLE/Contents/MacOS/$APP_NAME" \
     "$SCRIPT_DIR/Sources/main.swift"
+
+# --- Build Widget Extension ---
+
+WIDGET_NAME="TokenTrackerWidget"
+WIDGET_BUNDLE="$APP_BUNDLE/Contents/PlugIns/$WIDGET_NAME.appex"
+
+echo "Building $WIDGET_NAME widget..."
+
+mkdir -p "$WIDGET_BUNDLE/Contents/MacOS"
+
+cp "$SCRIPT_DIR/Widget/WidgetInfo.plist" "$WIDGET_BUNDLE/Contents/Info.plist"
+
+xcrun swiftc \
+    $VFS_FLAGS \
+    -swift-version 5 \
+    -target "$TARGET" \
+    -sdk "$SDK_PATH" \
+    -parse-as-library \
+    -framework WidgetKit \
+    -framework SwiftUI \
+    -o "$WIDGET_BUNDLE/Contents/MacOS/$WIDGET_NAME" \
+    "$SCRIPT_DIR/Sources/Widget.swift"
+
+# --- Code Sign (inside-out: widget first, then app) ---
+
+echo "Signing..."
+
+codesign --force --sign - \
+    --entitlements "$SCRIPT_DIR/Widget/widget.entitlements" \
+    "$WIDGET_BUNDLE"
+
+codesign --force --sign - \
+    --entitlements "$SCRIPT_DIR/app.entitlements" \
+    "$APP_BUNDLE"
 
 echo ""
 echo "Build successful: $APP_BUNDLE"
